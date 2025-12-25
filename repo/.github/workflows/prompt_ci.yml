@@ -1,0 +1,536 @@
+# .github/workflows/prompt_ci.yml
+# Prompt CI Pipeline
+#
+# What this does:
+# 1) Lints prompt specs (required IR sections, metadata validity, red flags)
+# 2) Runs schema validation (if schema.json present)
+# 3) Runs evaluation (golden / variance / adversarial) based on risk_level
+# 4) Enforces regression gates using thresholds in metadata.yaml
+#
+# Notes:
+# - This workflow assumes you provide the scripts referenced below.
+# - Keep evaluation deterministic where possible: set model, seed (if supported), and temperature caps in test configs.
+
+name: Prompt CI
+
+on:
+  pull_request:
+    paths:
+      - "prompts/**"
+      - "evaluation/**"
+      - "runtime/**"
+      - ".github/workflows/prompt_ci.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "prompts/**"
+      - "evaluation/**"
+      - "runtime/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prompt-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect-changes:
+    name: Detect changed prompts
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.changed.outputs.changed }}
+      prompt_dirs: ${{ steps.changed.outputs.prompt_dirs }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: changed
+        name: Compute changed prompt directories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Find changed files in prompts/specs on PRs; on push use last commit.
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE="$(git rev-parse HEAD~1)"
+            HEAD="$(git rev-parse HEAD)"
+          fi
+
+          CHANGED_FILES="$(git diff --name-only "$BASE" "$HEAD" | grep '^prompts/specs/' || true)"
+
+          if [[ -z "$CHANGED_FILES" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "prompt_dirs=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Extract unique prompt directories: prompts/specs/<domain>/<prompt_name>/
+          PROMPT_DIRS="$(echo "$CHANGED_FILES" \
+            | awk -F/ 'NF>=4 {print $1"/"$2"/"$3"/"$4"/"}' \
+            | sort -u \
+            | jq -R -s -c 'split("\n")[:-1]')"
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "prompt_dirs=$PROMPT_DIRS" >> "$GITHUB_OUTPUT"
+
+  lint:
+    name: Lint prompt specs
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.changed == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          pip install -r evaluation/harness/requirements.txt
+
+      - name: Run prompt lint (IR + metadata)
+        shell: bash
+        env:
+          PROMPT_DIRS: ${{ needs.detect-changes.outputs.prompt_dirs }}
+        run: |
+          set -euo pipefail
+          python evaluation/harness/lint_prompts.py \
+            --prompt-dirs "$PROMPT_DIRS" \
+            --require-sections "Intent,Inputs,Outputs,Constraints,Control Policy" \
+            --fail-on-red-flags \
+            --validate-metadata
+
+      - name: Run schema checks (if any)
+        shell: bash
+        env:
+          PROMPT_DIRS: ${{ needs.detect-changes.outputs.prompt_dirs }}
+        run: |
+          set -euo pipefail
+          python evaluation/harness/validate_schemas.py \
+            --prompt-dirs "$PROMPT_DIRS"
+
+  eval-medium:
+    name: Evaluate (medium risk) — golden set
+    runs-on: ubuntu-latest
+    needs: [detect-changes, lint]
+    if: needs.detect-changes.outputs.changed == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          pip install -r evaluation/harness/requirements.txt
+
+      - name: Run golden evaluations (medium+ prompts)
+        shell: bash
+        env:
+          PROMPT_DIRS: ${{ needs.detect-changes.outputs.prompt_dirs }}
+        run: |
+          set -euo pipefail
+          python evaluation/harness/run_golden.py \
+            --prompt-dirs "$PROMPT_DIRS" \
+            --risk-levels "medium,high,critical" \
+            --write-report "evaluation/reports"
+
+      - name: Enforce golden gates
+        shell: bash
+        env:
+          PROMPT_DIRS: ${{ needs.detect-changes.outputs.prompt_dirs }}
+        run: |
+          set -euo pipefail
+          python evaluation/harness/enforce_gates.py \
+            --prompt-dirs "$PROMPT_DIRS" \
+            --gate "golden" \
+            --use-metadata-thresholds
+
+  eval-high:
+    name: Evaluate (high risk) — variance + regression
+    runs-on: ubuntu-latest
+    needs: [detect-changes, lint, eval-medium]
+    if: needs.detect-changes.outputs.changed == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          pip install -r evaluation/harness/requirements.txt
+
+      - name: Run variance evaluations (high+ prompts)
+        shell: bash
+        env:
+          PROMPT_DIRS: ${{ needs.detect-changes.outputs.prompt_dirs }}
+        run: |
+          set -euo pipefail
+          python evaluation/harness/run_variance.py \
+            --prompt-dirs "$PROMPT_DIRS" \
+            --risk-levels "high,critical" \
+            --runs-default 5 \
+            --write-report "evaluation/reports"
+
+      - name: Enforce variance gates
+        shell: bash
+        env:
+          PROMPT_DIRS: ${{ needs.detect-changes.outputs.prompt_dirs }}
+        run: |
+          set -euo pipefail
+          python evaluation/harness/enforce_gates.py \
+            --prompt-dirs "$PROMPT_DIRS" \
+            --gate "variance" \
+            --use-metadata-thresholds
+
+      - name: Enforce regression gates (compare vs main)
+        shell: bash
+        env:
+          PROMPT_DIRS: ${{ needs.detect-changes.outputs.prompt_dirs }}
+        run: |
+          set -euo pipefail
+          python evaluation/harness/regression_check.py \
+            --prompt-dirs "$PROMPT_DIRS" \
+            --baseline "main" \
+            --max-drop-default 0.05 \
+            --use-metadata-thresholds
+
+  eval-critical:
+    name: Evaluate (critical risk) — adversarial + policy
+    runs-on: ubuntu-latest
+    needs: [detect-changes, lint, eval-high]
+    if: needs.detect-changes.outputs.changed == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          pip install -r evaluation/harness/requirements.txt
+
+      - name: Run adversarial evaluations (critical prompts)
+        shell: bash
+        env:
+          PROMPT_DIRS: ${{ needs.detect-changes.outputs.prompt_dirs }}
+        run: |
+          set -euo pipefail
+          python evaluation/harness/run_adversarial.py \
+            --prompt-dirs "$PROMPT_DIRS" \
+            --risk-levels "critical" \
+            --write-report "evaluation/reports"
+
+      - name: Enforce adversarial gates
+        shell: bash
+        env:
+          PROMPT_DIRS: ${{ needs.detect-changes.outputs.prompt_dirs }}
+        run: |
+          set -euo pipefail
+          python evaluation/harness/enforce_gates.py \
+            --prompt-dirs "$PROMPT_DIRS" \
+            --gate "adversarial" \
+            --use-metadata-thresholds
+
+      - name: Policy checks (critical prompts)
+        shell: bash
+        env:
+          PROMPT_DIRS: ${{ needs.detect-changes.outputs.prompt_dirs }}
+        run: |
+          set -euo pipefail
+          python evaluation/harness/policy_check.py \
+            --prompt-dirs "$PROMPT_DIRS" \
+            --risk-levels "critical"
+
+  summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    needs: [detect-changes, lint, eval-medium, eval-high, eval-critical]
+    if: always()
+    steps:
+      - name: Report status
+        shell: bash
+        run: |
+          echo "Prompt CI completed."
+          echo "Changed prompts: ${{ needs.detect-changes.outputs.prompt_dirs }}"
+          echo "lint: ${{ needs.lint.result }}"
+          echo "eval-medium: ${{ needs.eval-medium.result }}"
+          echo "eval-high: ${{ needs.eval-high.result }}"
+          echo "eval-critical: ${{ needs.eval-critical.result }}"
+# Continuation: optional publishing + artifacts + required scripts contract.
+# Append to the end of .github/workflows/prompt_ci.yml (after the summary job)
+# OR replace the summary job with the enhanced one below.
+
+  upload-reports:
+    name: Upload evaluation reports (artifacts)
+    runs-on: ubuntu-latest
+    needs: [detect-changes, eval-medium, eval-high, eval-critical]
+    if: always() && needs.detect-changes.outputs.changed == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: prompt-evaluation-reports
+          path: evaluation/reports
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Optional: Only on pushes to main, publish prompt versions to a registry.
+  # If you run a separate CD pipeline, keep this disabled and move publishing there.
+  publish:
+    name: Publish to Prompt Registry (main only)
+    runs-on: ubuntu-latest
+    needs: [detect-changes, lint, eval-medium, eval-high, eval-critical]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.detect-changes.outputs.changed == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          pip install -r evaluation/harness/requirements.txt
+
+      - name: Publish changed prompts
+        shell: bash
+        env:
+          PROMPT_DIRS: ${{ needs.detect-changes.outputs.prompt_dirs }}
+          # Provide your registry endpoint and auth via GitHub Secrets.
+          PROMPT_REGISTRY_URL: ${{ secrets.PROMPT_REGISTRY_URL }}
+          PROMPT_REGISTRY_TOKEN: ${{ secrets.PROMPT_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          python evaluation/harness/publish_prompts.py \
+            --prompt-dirs "$PROMPT_DIRS" \
+            --registry-url "$PROMPT_REGISTRY_URL" \
+            --token "$PROMPT_REGISTRY_TOKEN" \
+            --require-status "active"
+
+  # Optional: Enhanced summary that posts a PR comment with results.
+  # Requires a GitHub token with PR comment permissions; can use GITHUB_TOKEN in most repos.
+  pr-comment:
+    name: Post PR comment (results)
+    runs-on: ubuntu-latest
+    needs: [detect-changes, lint, eval-medium, eval-high, eval-critical]
+    if: github.event_name == 'pull_request' && always() && needs.detect-changes.outputs.changed == 'true'
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build comment body
+        id: comment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROMPTS='${{ needs.detect-changes.outputs.prompt_dirs }}'
+          LINT='${{ needs.lint.result }}'
+          MED='${{ needs.eval-medium.result }}'
+          HIGH='${{ needs.eval-high.result }}'
+          CRIT='${{ needs.eval-critical.result }}'
+
+          cat > /tmp/comment.md <<EOF
+          ## Prompt CI Results
+
+          **Changed prompts:** \`$PROMPTS\`
+
+          | Stage | Result |
+          |------|--------|
+          | Lint (IR + metadata) | **$LINT** |
+          | Golden (medium+) | **$MED** |
+          | Variance + Regression (high+) | **$HIGH** |
+          | Adversarial + Policy (critical) | **$CRIT** |
+
+          Reports (artifact): \`prompt-evaluation-reports\` (if generated)
+
+          **Reminder:** If any stage fails, resolve structural issues first (contract/constraints/control), then add/adjust tests.
+          EOF
+
+          echo "path=/tmp/comment.md" >> "$GITHUB_OUTPUT"
+
+      - name: Post PR comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          path: ${{ steps.comment.outputs.path }}
+          recreate: true
+
+# ---------------------------
+# Required script contract
+# ---------------------------
+# This pipeline assumes the following scripts exist under evaluation/harness/:
+#
+# lint_prompts.py
+#   - Validates required Prompt IR sections in prompt.md
+#   - Validates metadata.yaml schema and presence of mandatory fields
+#   - Flags red-flag phrases (e.g., "use best judgment") if configured
+#
+# validate_schemas.py
+#   - Validates schema.json is valid JSON Schema (or your chosen schema format)
+#
+# run_golden.py
+#   - Executes golden set cases (jsonl) and produces a report with pass/fail and metrics
+#
+# run_variance.py
+#   - Executes the same cases multiple times; computes variance metrics and failure counts
+#
+# run_adversarial.py
+#   - Executes adversarial test suite; checks safety/compliance and robustness invariants
+#
+# enforce_gates.py
+#   - Reads evaluation output and compares to thresholds in metadata.yaml
+#
+# regression_check.py
+#   - Compares metrics against baseline branch (e.g., main) and enforces max-drop thresholds
+#
+# policy_check.py
+#   - Enforces organizational policies for critical prompts (logging, tool restrictions, citations rules)
+#
+# publish_prompts.py (optional)
+#   - Publishes prompt artifacts + metadata to a registry service
+#
+# Tip: Keep these scripts deterministic by pinning model & settings for CI runs, and by using a stable test harness.
+# Continuation: a stricter, production-grade variant with:
+# - a metadata schema validation step (JSON Schema for metadata.yaml)
+# - CODEOWNERS enforcement via required reviewers (handled in repo settings)
+# - caching for Python dependencies
+# - explicit environment variable contract for model/test harness
+#
+# This section is optional; treat it as "hardening add-ons" to the pipeline.
+# Append relevant jobs/steps or replace existing ones.
+
+# ---------------------------
+# Hardening add-ons (optional)
+# ---------------------------
+
+# 1) Add caching to all Python jobs (example snippet).
+# Add this block after "Set up Python" in each job that installs Python deps:
+#
+#      - name: Cache pip
+#        uses: actions/cache@v4
+#        with:
+#          path: ~/.cache/pip
+#          key: ${{ runner.os }}-pip-${{ hashFiles('evaluation/harness/requirements.txt') }}
+#          restore-keys: |
+#            ${{ runner.os }}-pip-
+
+# 2) Enforce metadata.yaml schema via a JSON Schema file.
+# Create: governance/policies/metadata.schema.json
+# Then add this step to the lint job before lint_prompts.py:
+
+#      - name: Validate prompt metadata.yaml schema
+#        shell: bash
+#        env:
+#          PROMPT_DIRS: ${{ needs.detect-changes.outputs.prompt_dirs }}
+#        run: |
+#          set -euo pipefail
+#          python evaluation/harness/validate_metadata_schema.py \
+#            --prompt-dirs "$PROMPT_DIRS" \
+#            --schema governance/policies/metadata.schema.json
+
+# 3) Explicit environment contract for CI harness:
+# - Prevent silent drift by requiring these values for evaluation scripts.
+
+# Add env at job level (example for eval-medium):
+#
+#    env:
+#      LLM_PROVIDER: "openai"
+#      LLM_MODEL: "gpt-5"
+#      LLM_TEMPERATURE: "0.2"
+#      LLM_MAX_TOKENS: "1200"
+#      LLM_SEED: "42"               # if supported by your provider
+#      PROMPT_EXECUTION_MODE: "ci"  # forces stricter validators
+#
+# Then, your harness scripts should fail fast if required env is missing.
+
+# 4) Optional: Split "publish" into a separate CD workflow.
+# Recommended for regulated environments: CI proves quality; CD controls release approval.
+#
+# Example: .github/workflows/prompt_cd.yml
+# - triggered on tags (e.g., prompts/pr_<id>/v1.2.0)
+# - re-runs validation
+# - publishes to registry
+# - requires manual approval for production environment
+
+# ---------------------------
+# Example CD workflow (optional)
+# ---------------------------
+# Save as .github/workflows/prompt_cd.yml if desired:
+
+# name: Prompt CD
+# on:
+#   push:
+#     tags:
+#       - "prompts/**"
+#
+# permissions:
+#   contents: read
+#
+# jobs:
+#   publish:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: actions/setup-python@v5
+#         with:
+#           python-version: "3.11"
+#       - name: Cache pip
+#         uses: actions/cache@v4
+#         with:
+#           path: ~/.cache/pip
+#           key: ${{ runner.os }}-pip-${{ hashFiles('evaluation/harness/requirements.txt') }}
+#       - name: Install dependencies
+#         run: pip install -r evaluation/harness/requirements.txt
+#       - name: Re-validate and publish
+#         env:
+#           PROMPT_REGISTRY_URL: ${{ secrets.PROMPT_REGISTRY_URL }}
+#           PROMPT_REGISTRY_TOKEN: ${{ secrets.PROMPT_REGISTRY_TOKEN }}
+#         run: |
+#           set -euo pipefail
+#           python evaluation/harness/publish_prompts_from_tag.py \
+#             --registry-url "$PROMPT_REGISTRY_URL" \
+#             --token "$PROMPT_REGISTRY_TOKEN"
+
+# ---------------------------
+# Minimal file requirements recap
+# ---------------------------
+# For each prompt under prompts/specs/<domain>/<prompt_name>/:
+# - prompt.md        (Prompt IR + final prompt text)
+# - metadata.yaml    (id, version, risk_level, ir_level, owners, tests thresholds)
+# - changelog.md     (human-readable change history)
+# - tests/           (golden sets etc., per risk level)
+#
+# The CI workflow enforces presence and quality gates based on risk_level.
+
+# ---------------------------
+# Practical implementation note
+# ---------------------------
+# If you want, I can also provide:
+# - metadata.schema.json (for validate_metadata_schema.py)
+# - a starter implementation of lint_prompts.py and enforce_gates.py
+# - a golden set format (jsonl) and report format (md/json)
